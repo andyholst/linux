@@ -34,6 +34,7 @@
 #include <linux/err.h>
 #include <linux/bits.h>
 #include <asm/barrier.h>
+#include <acpi/battery.h>
 
 /* data port used by Apple SMC */
 #define APPLESMC_DATA_PORT	0x300
@@ -75,6 +76,9 @@
 #define FAN_ID_FMT		"F%dID" /* r-o char[16] */
 
 #define TEMP_SENSOR_TYPE	"sp78"
+
+#define CHARGE_END_KEY		"BCLM" /* r-w ui8 */
+#define CHARGE_FULL_KEY		"BFCL" /* r-w ui8 */
 
 /* List of keys used to read/write fan speeds */
 static const char *const fan_speed_fmt[] = {
@@ -131,6 +135,7 @@ static struct applesmc_registers {
 	int num_light_sensors;		/* number of light sensors */
 	bool has_accelerometer;		/* has motion sensor */
 	bool has_key_backlight;		/* has keyboard backlight */
+	bool has_charge_control;	/* has battery charge thresholds */
 	bool init_complete;		/* true when fully initialized */
 	struct applesmc_entry *cache;	/* cached key entries */
 	const char **index;		/* temperature key index */
@@ -637,13 +642,20 @@ static int applesmc_init_smcreg_try(void)
 		return ret;
 
 	s->num_light_sensors = left_light_sensor + right_light_sensor;
+
+	/* Check for charge control support */
+	ret = applesmc_has_key(CHARGE_END_KEY, &s->has_charge_control);
+	if (ret)
+		return ret;
+
 	s->init_complete = true;
 
-	pr_info("key=%d fan=%d temp=%d index=%d acc=%d lux=%d kbd=%d\n",
+	pr_info("key=%d fan=%d temp=%d index=%d acc=%d lux=%d kbd=%d chg=%d\n",
 	       s->key_count, s->fan_count, s->temp_count, s->index_count,
 	       s->has_accelerometer,
 	       s->num_light_sensors,
-	       s->has_key_backlight);
+	       s->has_key_backlight,
+	       s->has_charge_control);
 
 	return 0;
 }
@@ -1144,6 +1156,124 @@ static void applesmc_release_key_backlight(void)
 	destroy_workqueue(applesmc_led_wq);
 }
 
+/*
+ * Battery charge control
+ *
+ * Apple Macs expose battery charge threshold control via SMC keys BCLM
+ * (charge end threshold) and BFCL (charge full threshold). We expose these
+ * via the power_supply class using the ACPI battery hook mechanism.
+ */
+
+static ssize_t applesmc_charge_show(const char *key, struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	u8 val;
+	int ret;
+
+	ret = applesmc_read_key(key, &val, 1);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", val);
+}
+
+static ssize_t applesmc_charge_store(const char *key, struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	unsigned long val;
+	int ret;
+
+	if (kstrtoul(buf, 10, &val) < 0 || val < 10 || val > 100)
+		return -EINVAL;
+
+	mutex_lock(&smcreg.mutex);
+	ret = write_smc(APPLESMC_WRITE_CMD, key, (const u8 *)&val, 1);
+	mutex_unlock(&smcreg.mutex);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static ssize_t charge_control_end_threshold_show(struct device *dev,
+						  struct device_attribute *attr,
+						  char *buf)
+{
+	return applesmc_charge_show(CHARGE_END_KEY, dev, attr, buf);
+}
+
+static ssize_t charge_control_end_threshold_store(struct device *dev,
+						   struct device_attribute *attr,
+						   const char *buf, size_t count)
+{
+	return applesmc_charge_store(CHARGE_END_KEY, dev, attr, buf, count);
+}
+
+static ssize_t charge_control_full_threshold_show(struct device *dev,
+						   struct device_attribute *attr,
+						   char *buf)
+{
+	return applesmc_charge_show(CHARGE_FULL_KEY, dev, attr, buf);
+}
+
+static ssize_t charge_control_full_threshold_store(struct device *dev,
+						    struct device_attribute *attr,
+						    const char *buf, size_t count)
+{
+	return applesmc_charge_store(CHARGE_FULL_KEY, dev, attr, buf, count);
+}
+
+static DEVICE_ATTR_RW(charge_control_end_threshold);
+static DEVICE_ATTR_RW(charge_control_full_threshold);
+
+static int applesmc_battery_add(struct power_supply *battery,
+				 struct acpi_battery_hook *hook)
+{
+	int ret;
+
+	ret = device_create_file(&battery->dev,
+				 &dev_attr_charge_control_end_threshold);
+	if (ret)
+		return ret;
+
+	ret = device_create_file(&battery->dev,
+				 &dev_attr_charge_control_full_threshold);
+	if (ret)
+		device_remove_file(&battery->dev,
+				   &dev_attr_charge_control_end_threshold);
+
+	return ret;
+}
+
+static int applesmc_battery_remove(struct power_supply *battery,
+				    struct acpi_battery_hook *hook)
+{
+	device_remove_file(&battery->dev,
+			   &dev_attr_charge_control_full_threshold);
+	device_remove_file(&battery->dev,
+			   &dev_attr_charge_control_end_threshold);
+	return 0;
+}
+
+static struct acpi_battery_hook applesmc_battery_hook = {
+	.add_battery = applesmc_battery_add,
+	.remove_battery = applesmc_battery_remove,
+	.name = "AppleSMC Charge Control",
+};
+
+static void applesmc_charge_control_init(void)
+{
+	if (smcreg.has_charge_control)
+		battery_hook_register(&applesmc_battery_hook);
+}
+
+static void applesmc_charge_control_exit(void)
+{
+	if (smcreg.has_charge_control)
+		battery_hook_unregister(&applesmc_battery_hook);
+}
+
 static int applesmc_dmi_match(const struct dmi_system_id *id)
 {
 	return 1;
@@ -1558,6 +1688,8 @@ static int __init applesmc_init(void)
 		goto out_light_ledclass;
 	}
 
+	applesmc_charge_control_init();
+
 	return 0;
 
 out_light_ledclass:
@@ -1584,6 +1716,7 @@ out:
 
 static void __exit applesmc_exit(void)
 {
+	applesmc_charge_control_exit();
 	hwmon_device_unregister(hwmon_dev);
 	applesmc_release_key_backlight();
 	applesmc_release_light_sensor();

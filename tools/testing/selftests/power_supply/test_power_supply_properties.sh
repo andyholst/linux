@@ -18,7 +18,7 @@ count_tests() {
 	SUPPLIES=$1
 
 	# This needs to be updated every time a new test is added.
-	NUM_TESTS=33
+	NUM_TESTS=35
 
 	total_tests=0
 
@@ -110,6 +110,10 @@ for DEVNAME in $supplies; do
 	test_sysfs_prop_optional energy_full "uWh"
 	test_sysfs_prop_optional energy_full_design "uWh"
 	test_sysfs_prop_optional energy_full_design "uWh"
+
+	# charge control thresholds
+	test_sysfs_prop_optional_range charge_control_end_threshold 0 100
+	test_sysfs_prop_optional_range charge_control_start_threshold 0 100
 done
 
 ktap_finished
