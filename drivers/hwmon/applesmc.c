@@ -34,7 +34,7 @@
 #include <linux/err.h>
 #include <linux/bits.h>
 #include <asm/barrier.h>
-#include <acpi/battery.h>
+#include <linux/power_supply.h>
 
 /* data port used by Apple SMC */
 #define APPLESMC_DATA_PORT	0x300
@@ -136,6 +136,7 @@ static struct applesmc_registers {
 	bool has_accelerometer;		/* has motion sensor */
 	bool has_key_backlight;		/* has keyboard backlight */
 	bool has_charge_control;	/* has battery charge thresholds */
+	struct power_supply *battery;	/* battery power supply device */
 	bool init_complete;		/* true when fully initialized */
 	struct applesmc_entry *cache;	/* cached key entries */
 	const char **index;		/* temperature key index */
@@ -1161,7 +1162,12 @@ static void applesmc_release_key_backlight(void)
  *
  * Apple Macs expose battery charge threshold control via SMC keys BCLM
  * (charge end threshold) and BFCL (charge full threshold). We expose these
- * via the power_supply class using the ACPI battery hook mechanism.
+ * via the power_supply class.
+ *
+ * The acpi_battery_hook mechanism doesn't work when the battery is
+ * registered by a driver like 'sbs' that doesn't call the hooks.
+ * Instead, we find the battery power supply device directly and add
+ * our attributes to it.
  */
 
 static ssize_t applesmc_charge_show(const char *key, struct device *dev,
@@ -1227,51 +1233,53 @@ static ssize_t charge_control_full_threshold_store(struct device *dev,
 static DEVICE_ATTR_RW(charge_control_end_threshold);
 static DEVICE_ATTR_RW(charge_control_full_threshold);
 
-static int applesmc_battery_add(struct power_supply *battery,
-				 struct acpi_battery_hook *hook)
-{
-	int ret;
-
-	ret = device_create_file(&battery->dev,
-				 &dev_attr_charge_control_end_threshold);
-	if (ret)
-		return ret;
-
-	ret = device_create_file(&battery->dev,
-				 &dev_attr_charge_control_full_threshold);
-	if (ret)
-		device_remove_file(&battery->dev,
-				   &dev_attr_charge_control_end_threshold);
-
-	return ret;
-}
-
-static int applesmc_battery_remove(struct power_supply *battery,
-				    struct acpi_battery_hook *hook)
-{
-	device_remove_file(&battery->dev,
-			   &dev_attr_charge_control_full_threshold);
-	device_remove_file(&battery->dev,
-			   &dev_attr_charge_control_end_threshold);
-	return 0;
-}
-
-static struct acpi_battery_hook applesmc_battery_hook = {
-	.add_battery = applesmc_battery_add,
-	.remove_battery = applesmc_battery_remove,
-	.name = "AppleSMC Charge Control",
-};
-
 static void applesmc_charge_control_init(void)
 {
-	if (smcreg.has_charge_control)
-		battery_hook_register(&applesmc_battery_hook);
+	struct power_supply *psy;
+	int ret;
+
+	if (!smcreg.has_charge_control)
+		return;
+
+	/* Find the battery power supply device */
+	psy = power_supply_get_by_name("BAT0");
+	if (!psy) {
+		pr_warn("BAT0 power_supply not found, deferring charge control\n");
+		return;
+	}
+
+	ret = device_create_file(&psy->dev, &dev_attr_charge_control_end_threshold);
+	if (ret) {
+		pr_err("Failed to create charge_control_end_threshold: %d\n", ret);
+		goto put_psy;
+	}
+
+	ret = device_create_file(&psy->dev, &dev_attr_charge_control_full_threshold);
+	if (ret) {
+		pr_err("Failed to create charge_control_full_threshold: %d\n", ret);
+		goto remove_end;
+	}
+
+	smcreg.battery = psy;
+	pr_info("charge_control registered on BAT0\n");
+	return;
+
+remove_end:
+	device_remove_file(&psy->dev, &dev_attr_charge_control_end_threshold);
+put_psy:
+	power_supply_put(psy);
 }
 
 static void applesmc_charge_control_exit(void)
 {
-	if (smcreg.has_charge_control)
-		battery_hook_unregister(&applesmc_battery_hook);
+	if (!smcreg.battery)
+		return;
+	device_remove_file(&smcreg.battery->dev,
+			   &dev_attr_charge_control_full_threshold);
+	device_remove_file(&smcreg.battery->dev,
+			   &dev_attr_charge_control_end_threshold);
+	power_supply_put(smcreg.battery);
+	smcreg.battery = NULL;
 }
 
 static int applesmc_dmi_match(const struct dmi_system_id *id)
